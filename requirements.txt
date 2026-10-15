@@ -4,3 +4,5 @@ numpy
 Pillow
 datasets
 torch
+streamlit
+plotly
