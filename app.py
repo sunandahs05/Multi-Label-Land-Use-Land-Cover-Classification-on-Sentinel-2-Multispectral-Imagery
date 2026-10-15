@@ -142,8 +142,13 @@ def metric_chart(df: pd.DataFrame, metrics: list[str], title: str):
         melted, x="Metric", y="Score", color=label_col, barmode="group",
         title=title, text_auto=".3f",
     )
-    fig.update_traces(marker_color="#2d8a62")
-    fig.update_layout(template="plotly_white", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", legend_title_text="", yaxis_range=[0, 1], margin=dict(l=10, r=10, t=60, b=10))
+    # Keep one distinct, consistent colour per model rather than colouring every bar alike.
+    fig.update_layout(
+        template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)", legend_title_text="",
+        yaxis_range=[0, 1], margin=dict(l=10, r=10, t=60, b=10),
+        colorway=["#16805d", "#3987c9", "#e39b32", "#9467bd", "#d65f5f"],
+    )
     st.plotly_chart(fig, width="stretch")
 
 
@@ -190,6 +195,65 @@ def make_rgb(image: np.ndarray) -> np.ndarray:
         hi = lo + 1.0
     rgb = np.nan_to_num((rgb - lo) / (hi - lo), nan=0.0, posinf=1.0, neginf=0.0)
     return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+
+
+@st.cache_data(show_spinner="Loading the matching feature sequence…")
+def find_temporal_feature_row(spatial_id: str) -> tuple[str, int, np.ndarray, np.ndarray] | None:
+    """Resolve a sample location to the correct split-specific compressed feature cache."""
+    manifest_path = DATA_DIR / "temporal_sequences.csv"
+    cache_dir = DATA_DIR / "full_feature_cache"
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = pd.read_csv(manifest_path)
+        if not {"spatial_id", "split"}.issubset(manifest.columns):
+            return None
+        matches = manifest.loc[manifest["spatial_id"].astype(str) == str(spatial_id)]
+        if matches.empty:
+            return None
+        split = str(matches.iloc[0]["split"])
+        split_rows = manifest.loc[manifest["split"].astype(str) == split].reset_index(drop=True)
+        row_matches = split_rows.index[split_rows["spatial_id"].astype(str) == str(spatial_id)].tolist()
+        if not row_matches:
+            return None
+        row = int(row_matches[0])
+        cache_path = cache_dir / f"temporal_features_{split}_seed2026.npz"
+        if not cache_path.exists():
+            return None
+        with np.load(cache_path, allow_pickle=False) as cache:
+            x_key = "X_temporal" if "X_temporal" in cache.files else None
+            y_key = "Y" if "Y" in cache.files else None
+            if x_key is None or y_key is None:
+                return None
+            if row >= cache[x_key].shape[0]:
+                return None
+            sequence = np.asarray(cache[x_key][row], dtype=np.float32)
+            target = np.asarray(cache[y_key][row], dtype=np.float32)
+        if sequence.shape != (4, 2048):
+            return None
+        return split, row, sequence, target
+    except (OSError, ValueError, KeyError, pd.errors.ParserError):
+        return None
+
+
+def render_feature_heatmap(sequence: np.ndarray, title: str = "Feature activations across four dates"):
+    """Render the real four-by-2048 feature sequence with a diverging colour scale."""
+    fig = go.Figure(data=go.Heatmap(
+        z=sequence,
+        x=np.arange(1, sequence.shape[1] + 1),
+        y=["Date 1", "Date 2", "Date 3", "Date 4"],
+        colorscale="RdYlBu_r",
+        zmid=float(np.nanmedian(sequence)),
+        colorbar=dict(title="Feature value"),
+        hovertemplate="%{y}<br>Feature %{x}<br>Value: %{z:.3f}<extra></extra>",
+    ))
+    fig.update_layout(
+        title=title, template="plotly_white", height=330,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        xaxis_title="Feature index (1–2048)", yaxis_title="Observation date",
+        margin=dict(l=10, r=10, t=55, b=10),
+    )
+    return fig
 
 # Read the project's saved experiment results. Groups remain separate by design.
 baseline_test = read_csv("temporal_data/full_data_test_comparison.csv")
@@ -453,44 +517,85 @@ elif page == "Temporal imagery & features":
             st.info("No local image/tensor demo has been found yet. The repository's model results still work without it. Add one real `(4, 6, 120, 120)` NumPy tensor to `temporal_data/sample_tensors/` to show the same location at four observations.")
 
     with tab_features:
-        st.markdown("**What is a feature vector?** The pretrained ResNet50 maps each date's six-band image to 2,048 learned numerical features. Temporal models then use the four vectors in sequence.")
-        feature_candidates: list[Path] = []
-        for folder in [ROOT / "temporal_data", ROOT / "data" / "demo_features"]:
-            if folder.exists():
-                feature_candidates.extend(folder.rglob("*features*.npy"))
-                feature_candidates.extend(folder.rglob("*feature*.npy"))
-        feature_candidates = sorted(set(p for p in feature_candidates if p.is_file()))
-        if feature_candidates:
-            chosen_feature = st.selectbox("Choose a saved feature array", feature_candidates, format_func=lambda x: str(x.relative_to(ROOT)))
+        st.markdown("#### From image to learned features")
+        st.write("Each date is encoded as 2,048 numbers by the pretrained ResNet50. The four vectors are then supplied to a temporal classifier.")
+        st.caption("Choose a location in the image tab first. The dashboard will look up its split and matching row in the saved feature cache automatically.")
+
+        sample_path = DATA_DIR / "sample_tensors" / "sample_X.npy"
+        metadata_path = DATA_DIR / "sample_tensors" / "sample_metadata.json"
+        sample_metadata = []
+        if metadata_path.exists():
             try:
-                feat = np.load(chosen_feature, mmap_mode="r", allow_pickle=False)
-                st.caption(f"Array shape: `{feat.shape}` · dtype: `{feat.dtype}`")
-                if feat.ndim == 3 and feat.shape[1] == 4 and feat.shape[2] == 2048:
-                    row = st.slider("Sequence index to inspect", 0, int(feat.shape[0]) - 1, 0)
-                    vector = np.asarray(feat[row])
-                    st.markdown("**Feature intensity by date**")
-                    fig = go.Figure(data=go.Heatmap(z=vector, x=list(range(1, 2049)), y=["Date 1", "Date 2", "Date 3", "Date 4"], colorscale=[[0, "#e8f5ed"], [0.5, "#75b798"], [1, "#176b4d"]], colorbar=dict(title="Value")))
-                    fig.update_layout(xaxis_title="Feature index (1–2048)", yaxis_title="Observation", height=300, margin=dict(l=10, r=10, t=25, b=10))
-                    st.plotly_chart(fig, width="stretch")
-                    st.caption("This heatmap shows the numerical representation, not a spatial image. Feature dimensions are learned latent values and usually do not have individual human-readable names.")
-                elif feat.ndim == 2 and feat.shape[1] == 2048:
-                    row = st.slider("Feature-vector row", 0, int(feat.shape[0]) - 1, 0)
-                    vector = np.asarray(feat[row])
-                    fig = px.line(x=np.arange(1, len(vector) + 1), y=vector, labels={"x": "Feature index", "y": "Activation"}, title="One 2,048-dimensional feature vector")
-                    fig.update_traces(line_color="#21845a")
-                    fig.update_layout(height=300, margin=dict(l=10, r=10, t=50, b=10))
-                    st.plotly_chart(fig, width="stretch")
-                else:
-                    st.warning("This array is not a recognised `(N, 4, 2048)` temporal-feature cache or `(N, 2048)` feature matrix. Use the demo instructions to export one small example.")
-            except Exception as exc:
-                st.error(f"Could not inspect feature array: {exc}")
+                with metadata_path.open("r", encoding="utf-8-sig") as handle:
+                    loaded_metadata = json.load(handle)
+                if isinstance(loaded_metadata, list):
+                    sample_metadata = loaded_metadata
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        # Use the selected sample location from the image tab's Streamlit state.
+        chosen_item = None
+        if sample_metadata:
+            current_index = st.session_state.get("location_sample_X.npy", 0)
+            if isinstance(current_index, int) and 0 <= current_index < len(sample_metadata):
+                chosen_item = sample_metadata[current_index]
+
+        if isinstance(chosen_item, dict) and chosen_item.get("spatial_id"):
+            spatial_id = str(chosen_item["spatial_id"])
+            mapped = find_temporal_feature_row(spatial_id)
+            if mapped is not None:
+                split, row, feature_sequence, target = mapped
+                k1, k2, k3 = st.columns(3)
+                k1.metric("Location", spatial_id)
+                k2.metric("Dataset split", split.title())
+                k3.metric("Feature sequence", "4 × 2,048")
+                st.plotly_chart(render_feature_heatmap(feature_sequence), width="stretch")
+
+                # A per-date distribution plot helps explain how activations vary over time.
+                distribution = pd.DataFrame({
+                    "Activation": feature_sequence.reshape(-1),
+                    "Observation": np.repeat(["Date 1", "Date 2", "Date 3", "Date 4"], feature_sequence.shape[1]),
+                })
+                fig_hist = px.histogram(
+                    distribution, x="Activation", color="Observation", barmode="overlay",
+                    nbins=55, opacity=0.68,
+                    color_discrete_map={"Date 1": "#16805d", "Date 2": "#3987c9", "Date 3": "#e39b32", "Date 4": "#9467bd"},
+                    title="Feature-value distributions by date",
+                    labels={"Activation": "Feature value", "count": "Number of features"},
+                )
+                fig_hist.update_layout(
+                    template="plotly_white", height=340, bargap=0.08,
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    legend_title_text="Observation", margin=dict(l=10, r=10, t=55, b=10),
+                )
+                st.plotly_chart(fig_hist, width="stretch")
+                st.caption("The heatmap and histogram show learned numerical activations, not land-cover pixels. Feature indices do not have individual human-readable meanings.")
+
+                with st.expander("Technical details and integrity checks"):
+                    st.write(f"Cache: `temporal_data/full_feature_cache/temporal_features_{split}_seed2026.npz`")
+                    st.write(f"Split-relative row: `{row}` · feature shape: `{feature_sequence.shape}` · target vector length: `{target.shape[0]}`")
+                    st.write("The sample location is matched by `spatial_id` against `temporal_sequences.csv`, then indexed in that split's manifest order.")
+                    vocab = read_csv("temporal_data/label_vocabulary.csv")
+                    if vocab is not None:
+                        st.write("Ground-truth target vector (1 = present label):")
+                        target_df = pd.DataFrame({"Label index": np.arange(len(target)), "Present": target.astype(int)})
+                        st.dataframe(target_df[target_df["Present"] == 1], width="stretch", hide_index=True)
+            else:
+                st.warning("Could not map this sample to its split-specific feature cache. Check that `temporal_sequences.csv` and `temporal_data/full_feature_cache/` are available locally.")
         else:
-            st.info("No feature cache was found in the dashboard's conventional locations. If your feature cache uses another filename/folder, copy just one small sample to `data/demo_features/` as a NumPy `.npy` file. Expected shape: `(1, 4, 2048)` or `(4, 2048)`. Avoid copying the full cache into Git.")
-        st.markdown("**Pipeline view**")
+            st.info("Select a location in the **Four-date image sequence** tab to load its matching feature sequence here.")
+
+        st.markdown("#### Pipeline")
         f1, f2, f3 = st.columns(3)
-        f1.markdown("**Image**\n\n`(6, 120, 120)`")
-        f2.markdown("**ResNet50**\n\n`2048 features / date`")
-        f3.markdown("**Temporal model**\n\n`4 × 2048` sequence")
+        with f1:
+            st.markdown("**1 · Multispectral image**")
+            st.code("6 bands × 120 × 120")
+        with f2:
+            st.markdown("**2 · ResNet50 encoder**")
+            st.code("2,048 features / date")
+        with f3:
+            st.markdown("**3 · Temporal classifier**")
+            st.code("4 dates × 2,048")
 
     with tab_setup:
         st.markdown("### Suggested demo folder layout")
@@ -520,8 +625,24 @@ elif page == "Available files":
         st.write(("✅" if p.exists() else "⚠️") + f" `{rel}`" + (f" · {p.stat().st_size:,} bytes" if p.exists() else " · not found"))
     class_dist = read_csv("temporal_data/class_distribution.csv")
     if class_dist is not None:
-        with st.expander("Class distribution table"):
+        with st.expander("Class distribution chart and table", expanded=True):
             st.dataframe(class_dist, width="stretch", hide_index=True)
+            label_col = find_column(class_dist, ["label", "class", "label_name", "category"])
+            count_col = find_column(class_dist, ["count", "positive_count", "samples", "frequency"])
+            if label_col and count_col:
+                chart_data = class_dist.copy()
+                chart_data[count_col] = pd.to_numeric(chart_data[count_col], errors="coerce")
+                chart_data = chart_data.dropna(subset=[count_col]).sort_values(count_col, ascending=True)
+                fig_dist = px.bar(
+                    chart_data, x=count_col, y=label_col, orientation="h",
+                    color=count_col, color_continuous_scale="Viridis",
+                    title="Label frequency (class imbalance)",
+                    labels={count_col: "Number of positive examples", label_col: "Land-cover label"},
+                )
+                fig_dist.update_layout(template="plotly_white", height=max(380, 24 * len(chart_data)),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    coloraxis_showscale=False, margin=dict(l=10, r=10, t=55, b=10))
+                st.plotly_chart(fig_dist, width="stretch")
     vocab = read_csv("temporal_data/label_vocabulary.csv")
     if vocab is not None:
         with st.expander("Label vocabulary"):

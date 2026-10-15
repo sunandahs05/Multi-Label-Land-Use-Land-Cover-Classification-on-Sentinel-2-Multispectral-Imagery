@@ -1,4 +1,4 @@
-# Python
+﻿# Python
 __pycache__/
 *.py[cod]
 *.pyo
@@ -11,14 +11,14 @@ venv/
 env/
 ENV/
 
-# Local data and datasets
+# Local datasets and downloaded archives
 data/*.parquet
 data/*.csv
 data/raw/
 data/processed/
 *.zip
 
-# Hugging Face / ML caches
+# Hugging Face caches
 .cache/
 .huggingface/
 huggingface/
@@ -33,6 +33,13 @@ mlruns/
 *.pth
 *.ckpt
 
+# Generated feature caches
+temporal_data/full_feature_cache/
+temporal_data/pilot_feature_cache/
+
+# Generated sample tensors (retain sample_metadata.json)
+temporal_data/sample_tensors/*.npy
+
 # Jupyter
 .ipynb_checkpoints/
 
@@ -46,22 +53,4 @@ Thumbs.db
 .env
 .env.*
 
-
-# Generated feature caches
-temporal_data/full_feature_cache/
-
-# Generated sample tensors
-temporal_data/sample_tensors/*.npy
-# Generated feature caches
-temporal_data/full_feature_cache/
-temporal_data/pilot_feature_cache/
-
-# Generated sample tensors
-temporal_data/sample_tensors/*.npy
-
-# Generated experiment checkpoints
-temporal_data/attention_experiment/*.pt
-temporal_data/controlled_comparison/*.pt
-temporal_data/gru_experiment/*.pt
-
-# Keep experiment metrics and training histories tracked
+# End
